@@ -44,6 +44,9 @@ pub unsafe extern "C" fn genlmsg_user_hdr(ghdr: *const GenlMsgHdr) -> *mut c_voi
 
 #[no_mangle]
 pub unsafe extern "C" fn genlmsg_user_data(ghdr: *const GenlMsgHdr, hdrlen: c_int) -> *mut c_void {
+    if ghdr.is_null() || hdrlen < 0 {
+        return ptr::null_mut();
+    }
     let h = genlmsg_user_hdr(ghdr) as *const u8;
     h.add(nlmsg_align(hdrlen as usize)) as *mut c_void
 }
@@ -57,11 +60,17 @@ pub unsafe extern "C" fn genlmsg_user_datalen(ghdr: *const GenlMsgHdr, hdrlen: c
 
 #[no_mangle]
 pub unsafe extern "C" fn genlmsg_data(ghdr: *const GenlMsgHdr) -> *mut c_void {
+    if ghdr.is_null() {
+        return ptr::null_mut();
+    }
     (ghdr as *const u8).add(GENL_HDRLEN) as *mut c_void
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn genlmsg_attrdata(ghdr: *const GenlMsgHdr, hdrlen: c_int) -> *mut NlAttr {
+    if ghdr.is_null() || hdrlen < 0 {
+        return ptr::null_mut();
+    }
     let d = genlmsg_data(ghdr) as *const u8;
     d.add(nlmsg_align(hdrlen as usize)) as *mut NlAttr
 }
@@ -75,7 +84,7 @@ pub unsafe extern "C" fn genlmsg_attrlen(ghdr: *const GenlMsgHdr, hdrlen: c_int)
 
 #[no_mangle]
 pub unsafe extern "C" fn genlmsg_valid_hdr(hdr: *const NlMsgHdr, hdrlen: c_int) -> bool {
-    if hdr.is_null() {
+    if hdr.is_null() || hdrlen < 0 {
         return false;
     }
     let dlen = nlmsg_datalen(hdr);
@@ -113,7 +122,7 @@ pub unsafe extern "C" fn genlmsg_put(
     cmd: u8,
     version: u8,
 ) -> *mut c_void {
-    if msg.is_null() {
+    if msg.is_null() || hdrlen < 0 {
         return ptr::null_mut();
     }
     let payload = GENL_HDRLEN + nlmsg_align(hdrlen as usize);
@@ -369,6 +378,7 @@ pub struct GenlCache {
     pub entries: Vec<GenlFamily>,
 }
 
+#[derive(Clone)]
 pub struct GenlFamily {
     pub name: [u8; GENL_NAMSIZ],
     pub id: u16,
@@ -378,6 +388,7 @@ pub struct GenlFamily {
     pub mcast_groups: Vec<McastGroup>,
 }
 
+#[derive(Clone)]
 pub struct McastGroup {
     pub name: [u8; GENL_NAMSIZ],
     pub id: u32,
@@ -517,7 +528,7 @@ pub unsafe extern "C" fn genl_ctrl_search(cache: *mut GenlCache, id: u16) -> *mu
     }
     for f in &(*cache).entries {
         if f.id == id {
-            return f as *const GenlFamily as *mut GenlFamily;
+            return Box::into_raw(Box::new(f.clone()));
         }
     }
     ptr::null_mut()
@@ -533,7 +544,7 @@ pub unsafe extern "C" fn genl_ctrl_search_by_name(
     }
     for f in &(*cache).entries {
         if libc::strcmp(f.name.as_ptr() as _, name as _) == 0 {
-            return f as *const GenlFamily as *mut GenlFamily;
+            return Box::into_raw(Box::new(f.clone()));
         }
     }
     ptr::null_mut()
@@ -723,4 +734,103 @@ unsafe fn copy_attr_cstr(attr: *mut NlAttr, dst: &mut [u8; GENL_NAMSIZ]) {
     };
     let n = src_len.min(dst.len() - 1);
     ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), n);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_search_returns_owned_family() {
+        unsafe {
+            let mut cache = Box::new(GenlCache {
+                entries: vec![GenlFamily {
+                    name: [0; GENL_NAMSIZ],
+                    id: 7,
+                    version: 1,
+                    hdrsize: 0,
+                    maxattr: 10,
+                    mcast_groups: vec![McastGroup {
+                        name: [0; GENL_NAMSIZ],
+                        id: 3,
+                    }],
+                }],
+            });
+            cache.entries[0].name[..5].copy_from_slice(b"nl802");
+            let cache = Box::into_raw(cache);
+
+            let found = genl_ctrl_search(cache, 7);
+            assert!(!found.is_null());
+            assert_eq!(genl_family_get_id(found), 7);
+            genl_family_put(found);
+
+            let by_name = genl_ctrl_search_by_name(cache, c"nl802".as_ptr() as *const u8);
+            assert!(!by_name.is_null());
+            assert_eq!(genl_family_get_maxattr(by_name), 10);
+            genl_family_put(by_name);
+
+            genl_cache_free(cache);
+        }
+    }
+
+    #[test]
+    fn negative_generic_header_lengths_are_rejected() {
+        unsafe {
+            let msg = nlmsg_alloc_simple(GENL_ID_CTRL as c_int, NLM_F_REQUEST as c_int);
+            assert!(!msg.is_null());
+            let hdr = nlmsg_hdr(msg);
+            assert!(!genlmsg_valid_hdr(hdr, -1));
+            assert_eq!(
+                genlmsg_parse(hdr, -1, ptr::null_mut(), 0, ptr::null()),
+                -(NLE_INVAL)
+            );
+            nlmsg_free(msg);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_kernel_resolves_generic_netlink_control_family() {
+        unsafe {
+            let sk = crate::socket::nl_socket_alloc();
+            assert!(!sk.is_null());
+            assert_eq!(genl_connect(sk), 0);
+
+            let family = genl_ctrl_resolve(sk, c"nlctrl".as_ptr() as *const u8);
+            assert!(
+                family > 0,
+                "expected nlctrl family id from kernel, got {family}"
+            );
+
+            let group = genl_ctrl_resolve_grp(
+                sk,
+                c"nlctrl".as_ptr() as *const u8,
+                c"notify".as_ptr() as *const u8,
+            );
+            assert!(
+                group > 0,
+                "expected nlctrl notify group id from kernel, got {group}"
+            );
+
+            crate::socket::nl_socket_free(sk);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_kernel_nl80211_lookup_is_well_formed_even_when_absent() {
+        unsafe {
+            let sk = crate::socket::nl_socket_alloc();
+            assert!(!sk.is_null());
+            assert_eq!(genl_connect(sk), 0);
+
+            let family = genl_ctrl_resolve(sk, c"nl80211".as_ptr() as *const u8);
+            assert!(
+                family > 0 || family == -(NLE_OBJ_NOTFOUND),
+                "expected nl80211 family id or not-found, got {family}"
+            );
+
+            crate::socket::nl_socket_free(sk);
+        }
+    }
 }

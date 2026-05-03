@@ -7,10 +7,10 @@ decompilation of the Alpine Linux `libnl3-3.11.0-r0.apk` binary.  No libnl
 source code was consulted at any point.
 
 Built for the **jonerix** Linux distribution, where GPL and LGPL runtimes are
-prohibited.  Installs as both `libnl-3.so.200` and `libnl-genl-3.so.200` (one
-binary, two sonames) so jonerix builds of `hostapd` and `wpa_supplicant` can
-link their nl80211 support without modifications.  It is not intended to be a
-general drop-in replacement for arbitrary libnl consumers.
+prohibited.  The `aarch64-jonerix-linux-musl` target builds a static archive for
+linking into jonerix `hostapd` and `wpa_supplicant` builds, with packaging
+responsible for exposing the expected libnl link names.  It is not intended to be
+a general drop-in replacement for arbitrary libnl consumers.
 
 ---
 

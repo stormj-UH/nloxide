@@ -53,12 +53,11 @@ unsafe impl Send for NlSock {}
 
 impl NlSock {
     fn new(cb: *mut NlCb) -> *mut NlSock {
-        let pid = unsafe { libc::getpid() } as u32;
         let sk = Box::new(NlSock {
             s_local: SockaddrNl {
                 nl_family: AF_NETLINK,
                 nl_pad: 0,
-                nl_pid: pid,
+                nl_pid: alloc_local_port(),
                 nl_groups: 0,
             },
             s_peer: SockaddrNl {
@@ -69,7 +68,7 @@ impl NlSock {
             },
             s_fd: -1,
             s_proto: 0,
-            s_seq_next: pid, // use PID as initial seq
+            s_seq_next: unsafe { libc::getpid() } as u32, // use PID as initial seq
             s_seq_expect: 0,
             s_flags: 0,
             s_bufsize: 0,
@@ -1070,6 +1069,166 @@ mod tests {
 
             crate::message::nlmsg_free(msg);
             nl_socket_free(sk);
+        }
+    }
+
+    #[cfg(not(miri))]
+    struct CallbackCounts {
+        invalid: usize,
+        skipped: usize,
+        valid: usize,
+    }
+
+    #[cfg(not(miri))]
+    unsafe extern "C" fn count_invalid(_msg: *mut NlMsg, arg: *mut c_void) -> c_int {
+        (*(arg as *mut CallbackCounts)).invalid += 1;
+        NL_OK
+    }
+
+    #[cfg(not(miri))]
+    unsafe extern "C" fn count_skipped(_msg: *mut NlMsg, arg: *mut c_void) -> c_int {
+        (*(arg as *mut CallbackCounts)).skipped += 1;
+        NL_OK
+    }
+
+    #[cfg(not(miri))]
+    unsafe extern "C" fn count_valid(_msg: *mut NlMsg, arg: *mut c_void) -> c_int {
+        (*(arg as *mut CallbackCounts)).valid += 1;
+        NL_OK
+    }
+
+    #[cfg(not(miri))]
+    unsafe fn socketpair_sock() -> (*mut NlSock, c_int) {
+        let mut fds = [-1; 2];
+        assert_eq!(
+            libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()),
+            0
+        );
+        let sk = nl_socket_alloc();
+        assert!(!sk.is_null());
+        assert_eq!(nl_socket_set_fd(sk, fds[0]), 0);
+        (*sk).s_msgbufsize = 256;
+        (sk, fds[1])
+    }
+
+    #[cfg(not(miri))]
+    unsafe fn send_datagram(fd: c_int, buf: &[u8]) {
+        let sent = libc::send(fd, buf.as_ptr() as *const c_void, buf.len(), 0);
+        assert_eq!(sent, buf.len() as isize);
+    }
+
+    #[cfg(not(miri))]
+    fn push_nlmsg(buf: &mut Vec<u8>, nltype: u16, flags: u16, seq: u32, payload: &[u8]) {
+        let len = (NLMSG_HDRLEN + payload.len()) as u32;
+        buf.extend_from_slice(&len.to_ne_bytes());
+        buf.extend_from_slice(&nltype.to_ne_bytes());
+        buf.extend_from_slice(&flags.to_ne_bytes());
+        buf.extend_from_slice(&seq.to_ne_bytes());
+        buf.extend_from_slice(&0u32.to_ne_bytes());
+        buf.extend_from_slice(payload);
+        while !buf.len().is_multiple_of(4) {
+            buf.push(0);
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn recv_reports_short_error_messages_without_overread() {
+        unsafe {
+            let (sk, peer_fd) = socketpair_sock();
+            let mut counts = CallbackCounts {
+                invalid: 0,
+                skipped: 0,
+                valid: 0,
+            };
+            nl_socket_modify_cb(
+                sk,
+                NL_CB_INVALID as c_int,
+                0,
+                Some(count_invalid),
+                &mut counts as *mut CallbackCounts as *mut c_void,
+            );
+
+            let mut datagram = Vec::new();
+            push_nlmsg(&mut datagram, NLMSG_ERROR, 0, 0, &[0, 0, 0, 0]);
+            send_datagram(peer_fd, &datagram);
+
+            assert_eq!(nl_recvmsgs_default(sk), -(NLE_MSG_TOOSHORT));
+            assert_eq!(counts.invalid, 1);
+
+            nl_socket_free(sk);
+            libc::close(peer_fd);
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn recv_dispatches_noop_and_valid_messages_from_one_buffer() {
+        unsafe {
+            let (sk, peer_fd) = socketpair_sock();
+            nl_socket_disable_seq_check(sk);
+            let mut counts = CallbackCounts {
+                invalid: 0,
+                skipped: 0,
+                valid: 0,
+            };
+            nl_socket_modify_cb(
+                sk,
+                NL_CB_SKIPPED as c_int,
+                0,
+                Some(count_skipped),
+                &mut counts as *mut CallbackCounts as *mut c_void,
+            );
+            nl_socket_modify_cb(
+                sk,
+                NL_CB_VALID as c_int,
+                0,
+                Some(count_valid),
+                &mut counts as *mut CallbackCounts as *mut c_void,
+            );
+
+            let mut datagram = Vec::new();
+            push_nlmsg(&mut datagram, NLMSG_NOOP, 0, 1, &[]);
+            push_nlmsg(&mut datagram, NLMSG_MIN_TYPE, 0, 1, &[]);
+            send_datagram(peer_fd, &datagram);
+
+            assert_eq!(nl_recvmsgs_default(sk), 0);
+            assert_eq!(counts.skipped, 1);
+            assert_eq!(counts.valid, 1);
+
+            nl_socket_free(sk);
+            libc::close(peer_fd);
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn recv_sequence_mismatch_does_not_dispatch_valid_callback() {
+        unsafe {
+            let (sk, peer_fd) = socketpair_sock();
+            (*sk).s_seq_expect = 100;
+            let mut counts = CallbackCounts {
+                invalid: 0,
+                skipped: 0,
+                valid: 0,
+            };
+            nl_socket_modify_cb(
+                sk,
+                NL_CB_VALID as c_int,
+                0,
+                Some(count_valid),
+                &mut counts as *mut CallbackCounts as *mut c_void,
+            );
+
+            let mut datagram = Vec::new();
+            push_nlmsg(&mut datagram, NLMSG_MIN_TYPE, 0, 99, &[]);
+            send_datagram(peer_fd, &datagram);
+
+            assert_eq!(nl_recvmsgs_default(sk), -(crate::error::NLE_SEQ_MISMATCH));
+            assert_eq!(counts.valid, 0);
+
+            nl_socket_free(sk);
+            libc::close(peer_fd);
         }
     }
 }

@@ -7,7 +7,7 @@ license = "BSD-2-Clause"
 
 [lib]
 name = "nloxide"
-crate-type = ["cdylib", "staticlib"]
+crate-type = ["staticlib"]
 
 [dependencies]
 libc = { version = "0.2", default-features = false }

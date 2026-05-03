@@ -16,6 +16,26 @@ const NL_AUTO_SEQ: u32 = 0;
 const NL_AUTO_PID: u32 = 0;
 const DEFAULT_MSG_SIZE: usize = 4096;
 
+fn checked_nlmsg_align(n: usize) -> Option<usize> {
+    n.checked_add(3).map(|v| v & !3)
+}
+
+fn checked_nlmsg_size(payload: usize) -> Option<usize> {
+    NLMSG_HDRLEN.checked_add(payload)
+}
+
+unsafe fn nlmsg_attr_offset(hdr: *const NlMsgHdr, hdrlen: c_int) -> Option<usize> {
+    if hdr.is_null() || hdrlen < 0 {
+        return None;
+    }
+    let offset = checked_nlmsg_align(hdrlen as usize)?;
+    let datalen = nlmsg_datalen(hdr);
+    if datalen < 0 || offset > datalen as usize {
+        return None;
+    }
+    Some(offset)
+}
+
 pub struct NlMsg {
     pub proto: c_int,
     pub max_size: usize,
@@ -41,8 +61,18 @@ impl NlMsg {
     pub fn reserve(&mut self, len: usize, pad: usize) -> *mut u8 {
         let hdr = unsafe { &mut *self.hdr() };
         let cur = hdr.nlmsg_len as usize;
-        let aligned = nlmsg_align(len + pad);
-        let need = cur + aligned;
+        let Some(unpadded) = len.checked_add(pad) else {
+            return ptr::null_mut();
+        };
+        let Some(aligned) = checked_nlmsg_align(unpadded) else {
+            return ptr::null_mut();
+        };
+        let Some(need) = cur.checked_add(aligned) else {
+            return ptr::null_mut();
+        };
+        if need > u32::MAX as usize {
+            return ptr::null_mut();
+        }
         if need > self.buf_size {
             let new_size = if self.max_size > 0 {
                 if need > self.max_size {
@@ -50,7 +80,10 @@ impl NlMsg {
                 }
                 self.max_size
             } else {
-                need.max(DEFAULT_MSG_SIZE).next_power_of_two()
+                let Some(size) = need.max(DEFAULT_MSG_SIZE).checked_next_power_of_two() else {
+                    return ptr::null_mut();
+                };
+                size
             };
             let new_buf = unsafe { libc::realloc(self.buf as *mut c_void, new_size) as *mut u8 };
             if new_buf.is_null() {
@@ -137,6 +170,9 @@ pub unsafe extern "C" fn nlmsg_inherit(hdr: *const NlMsgHdr) -> *mut NlMsg {
 
 #[no_mangle]
 pub unsafe extern "C" fn nlmsg_convert(hdr: *mut NlMsgHdr) -> *mut NlMsg {
+    if hdr.is_null() || (*hdr).nlmsg_len < NLMSG_HDRLEN as u32 {
+        return ptr::null_mut();
+    }
     let size = (*hdr).nlmsg_len as usize;
     let sz = size.max(DEFAULT_MSG_SIZE);
     let buf = libc::malloc(sz) as *mut u8;
@@ -204,7 +240,10 @@ pub unsafe extern "C" fn nlmsg_tail(hdr: *const NlMsgHdr) -> *mut c_void {
     if hdr.is_null() {
         return ptr::null_mut();
     }
-    (hdr as *const u8).add(nlmsg_align((*hdr).nlmsg_len as usize)) as *mut c_void
+    let Some(offset) = checked_nlmsg_align((*hdr).nlmsg_len as usize) else {
+        return ptr::null_mut();
+    };
+    (hdr as *const u8).add(offset) as *mut c_void
 }
 
 #[no_mangle]
@@ -220,37 +259,54 @@ pub unsafe extern "C" fn nlmsg_attrdata(
     hdr: *const NlMsgHdr,
     hdrlen: c_int,
 ) -> *mut crate::attr::NlAttr {
+    let Some(offset) = nlmsg_attr_offset(hdr, hdrlen) else {
+        return ptr::null_mut();
+    };
     let data = nlmsg_data(hdr) as *const u8;
-    data.add(nlmsg_align(hdrlen as usize)) as *mut crate::attr::NlAttr
+    data.add(offset) as *mut crate::attr::NlAttr
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn nlmsg_attrlen(hdr: *const NlMsgHdr, hdrlen: c_int) -> c_int {
-    let dl = nlmsg_datalen(hdr);
-    dl - nlmsg_align(hdrlen as usize) as c_int
+    let Some(offset) = nlmsg_attr_offset(hdr, hdrlen) else {
+        return 0;
+    };
+    let dl = nlmsg_datalen(hdr) as usize;
+    dl.saturating_sub(offset).min(c_int::MAX as usize) as c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn nlmsg_size(payload: usize) -> usize {
-    NLMSG_HDRLEN + payload
+    checked_nlmsg_size(payload).unwrap_or(usize::MAX)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn nlmsg_total_size(payload: usize) -> usize {
-    nlmsg_align(nlmsg_size(payload))
+    checked_nlmsg_size(payload)
+        .and_then(checked_nlmsg_align)
+        .unwrap_or(usize::MAX)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn nlmsg_padlen(payload: usize) -> usize {
-    nlmsg_total_size(payload) - nlmsg_size(payload)
+    let Some(size) = checked_nlmsg_size(payload) else {
+        return 0;
+    };
+    let Some(total) = checked_nlmsg_align(size) else {
+        return 0;
+    };
+    total - size
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn nlmsg_valid_hdr(hdr: *const NlMsgHdr, hdrlen: c_int) -> bool {
-    if hdr.is_null() {
+    if hdr.is_null() || hdrlen < 0 || (*hdr).nlmsg_len < NLMSG_HDRLEN as u32 {
         return false;
     }
-    (*hdr).nlmsg_len >= nlmsg_size(hdrlen as usize) as u32
+    let Some(size) = checked_nlmsg_size(hdrlen as usize) else {
+        return false;
+    };
+    size <= u32::MAX as usize && (*hdr).nlmsg_len >= size as u32
 }
 
 #[no_mangle]
@@ -264,8 +320,17 @@ pub unsafe extern "C" fn nlmsg_ok(hdr: *const NlMsgHdr, remaining: c_int) -> boo
 
 #[no_mangle]
 pub unsafe extern "C" fn nlmsg_next(hdr: *const NlMsgHdr, remaining: *mut c_int) -> *mut NlMsgHdr {
-    let len = nlmsg_align((*hdr).nlmsg_len as usize) as i32;
-    *remaining -= len;
+    if hdr.is_null() || remaining.is_null() {
+        return ptr::null_mut();
+    }
+    let Some(len) = checked_nlmsg_align((*hdr).nlmsg_len as usize) else {
+        return ptr::null_mut();
+    };
+    if len > c_int::MAX as usize {
+        return ptr::null_mut();
+    }
+    let len = len as i32;
+    *remaining = (*remaining).saturating_sub(len);
     (hdr as *const u8).add(len as usize) as *mut NlMsgHdr
 }
 
@@ -278,7 +343,7 @@ pub unsafe extern "C" fn nlmsg_put(
     payload: c_int,
     flags: u16,
 ) -> *mut NlMsgHdr {
-    if msg.is_null() {
+    if msg.is_null() || payload < 0 {
         return ptr::null_mut();
     }
     // The header is at buf[0]; we need to write it and reserve space for payload
@@ -330,11 +395,14 @@ pub unsafe extern "C" fn nlmsg_expand(msg: *mut NlMsg, addlen: usize) -> c_int {
         return -(crate::error::NLE_INVAL);
     }
     let m = &mut *msg;
-    let need = m.buf_size + addlen;
+    let Some(need) = m.buf_size.checked_add(addlen) else {
+        return -(crate::error::NLE_NOMEM);
+    };
     let new_buf = libc::realloc(m.buf as _, need) as *mut u8;
     if new_buf.is_null() {
         return -(crate::error::NLE_NOMEM);
     }
+    ptr::write_bytes(new_buf.add(m.buf_size), 0, need - m.buf_size);
     m.buf = new_buf;
     m.buf_size = need;
     0
@@ -348,6 +416,9 @@ pub unsafe extern "C" fn nlmsg_parse(
     maxtype: c_int,
     _policy: *const c_void,
 ) -> c_int {
+    if !nlmsg_valid_hdr(hdr, hdrlen) {
+        return -(crate::error::NLE_INVAL);
+    }
     let attrdata = nlmsg_attrdata(hdr, hdrlen);
     let attrlen = nlmsg_attrlen(hdr, hdrlen);
     crate::attr::nla_parse(tb, maxtype, attrdata, attrlen, _policy)
@@ -359,6 +430,9 @@ pub unsafe extern "C" fn nlmsg_find_attr(
     hdrlen: c_int,
     attrtype: c_int,
 ) -> *mut crate::attr::NlAttr {
+    if !nlmsg_valid_hdr(hdr, hdrlen) {
+        return ptr::null_mut();
+    }
     let attrdata = nlmsg_attrdata(hdr, hdrlen);
     let attrlen = nlmsg_attrlen(hdr, hdrlen);
     crate::attr::nla_find(attrdata, attrlen, attrtype)
@@ -371,6 +445,9 @@ pub unsafe extern "C" fn nlmsg_validate(
     maxtype: c_int,
     _policy: *const c_void,
 ) -> c_int {
+    if !nlmsg_valid_hdr(hdr, hdrlen) {
+        return -(crate::error::NLE_INVAL);
+    }
     let attrdata = nlmsg_attrdata(hdr, hdrlen);
     let attrlen = nlmsg_attrlen(hdr, hdrlen);
     crate::attr::nla_validate(attrdata, attrlen, maxtype, _policy)
@@ -469,6 +546,48 @@ mod tests {
             assert!(!msg.is_null());
             assert!((*msg).buf_size >= NLMSG_HDRLEN);
             assert_eq!((*nlmsg_hdr(msg)).nlmsg_len, NLMSG_HDRLEN as u32);
+            nlmsg_free(msg);
+        }
+    }
+
+    #[test]
+    fn negative_payload_and_header_lengths_are_rejected() {
+        unsafe {
+            let msg = nlmsg_alloc();
+            assert!(!msg.is_null());
+            let hdr = nlmsg_hdr(msg);
+
+            assert!(nlmsg_put(msg, 0, 0, 1, -1, 0).is_null());
+            assert!(!nlmsg_valid_hdr(hdr, -1));
+            assert!(nlmsg_attrdata(hdr, -1).is_null());
+            assert_eq!(nlmsg_attrlen(hdr, -1), 0);
+            assert!(nlmsg_find_attr(hdr, -1, 1).is_null());
+            assert_eq!(
+                nlmsg_parse(hdr, -1, ptr::null_mut(), 0, ptr::null()),
+                -(crate::error::NLE_INVAL)
+            );
+            assert_eq!(
+                nlmsg_validate(hdr, -1, 0, ptr::null()),
+                -(crate::error::NLE_INVAL)
+            );
+
+            nlmsg_free(msg);
+        }
+    }
+
+    #[test]
+    fn checked_growth_paths_reject_overflow() {
+        unsafe {
+            let msg = nlmsg_alloc();
+            assert!(!msg.is_null());
+
+            assert!((*msg).reserve(usize::MAX, 1).is_null());
+
+            let old_size = (*msg).buf_size;
+            (*msg).buf_size = usize::MAX;
+            assert_eq!(nlmsg_expand(msg, 1), -(crate::error::NLE_NOMEM));
+            (*msg).buf_size = old_size;
+
             nlmsg_free(msg);
         }
     }

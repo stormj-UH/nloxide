@@ -6,7 +6,7 @@
 use crate::message::NlMsg;
 use crate::types::*;
 use core::ffi::{c_int, c_void};
-use core::ptr;
+use core::{ptr, slice};
 
 pub use crate::types::NlAttr;
 
@@ -28,6 +28,15 @@ const NLA_FLAG: u16 = 6;
 const NLA_MSECS: u16 = 7;
 const NLA_NESTED: u16 = 8;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct AttrView {
+    offset: usize,
+    attr_type: c_int,
+    payload_offset: usize,
+    payload_len: usize,
+    aligned_len: usize,
+}
+
 fn attr_payload_len(attr: *const NlAttr) -> usize {
     unsafe {
         if attr.is_null() || (*attr).nla_len < NLA_HDRLEN as u16 {
@@ -37,83 +46,212 @@ fn attr_payload_len(attr: *const NlAttr) -> usize {
     }
 }
 
-unsafe fn validate_attr(attr: *const NlAttr, maxtype: c_int, policy: *const c_void) -> c_int {
-    if attr.is_null() {
-        return -(crate::error::NLE_INVAL);
+fn read_u16_ne(buf: &[u8], offset: usize) -> Option<u16> {
+    let bytes = buf.get(offset..offset.checked_add(2)?)?;
+    Some(u16::from_ne_bytes([bytes[0], bytes[1]]))
+}
+
+fn parse_attr_at(buf: &[u8], offset: usize) -> Result<AttrView, c_int> {
+    let hdr_end = offset
+        .checked_add(NLA_HDRLEN)
+        .ok_or(-(crate::error::NLE_INVAL))?;
+    if hdr_end > buf.len() {
+        return Err(-(crate::error::NLE_INVAL));
     }
 
-    let t = nla_type(attr);
+    let attr_len = read_u16_ne(buf, offset).ok_or(-(crate::error::NLE_INVAL))? as usize;
+    let raw_type = read_u16_ne(buf, offset + 2).ok_or(-(crate::error::NLE_INVAL))?;
+    if attr_len < NLA_HDRLEN {
+        return Err(-(crate::error::NLE_INVAL));
+    }
+
+    let end = offset
+        .checked_add(attr_len)
+        .ok_or(-(crate::error::NLE_INVAL))?;
+    if end > buf.len() {
+        return Err(-(crate::error::NLE_INVAL));
+    }
+
+    let aligned_len = nla_align(attr_len);
+    if aligned_len < attr_len {
+        return Err(-(crate::error::NLE_INVAL));
+    }
+
+    Ok(AttrView {
+        offset,
+        attr_type: (raw_type & NLA_TYPE_MASK) as c_int,
+        payload_offset: hdr_end,
+        payload_len: attr_len - NLA_HDRLEN,
+        aligned_len,
+    })
+}
+
+fn validate_attr_view(
+    buf: &[u8],
+    attr: AttrView,
+    maxtype: c_int,
+    policy: Option<&[NlaPolicy]>,
+) -> Result<(), c_int> {
+    let t = attr.attr_type;
     if t == 0 || t > maxtype {
-        return 0;
-    }
-    if policy.is_null() {
-        return 0;
+        return Ok(());
     }
 
-    let pol = &*(policy as *const NlaPolicy).add(t as usize);
-    let payload_len = attr_payload_len(attr);
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    let pol = policy.get(t as usize).ok_or(-(crate::error::NLE_INVAL))?;
+    let payload = buf
+        .get(attr.payload_offset..attr.payload_offset + attr.payload_len)
+        .ok_or(-(crate::error::NLE_INVAL))?;
 
-    if pol.minlen != 0 && payload_len < pol.minlen as usize {
-        return -(crate::error::NLE_ATTRSIZE);
+    if pol.minlen != 0 && payload.len() < pol.minlen as usize {
+        return Err(-(crate::error::NLE_ATTRSIZE));
     }
-    if pol.maxlen != 0 && payload_len > pol.maxlen as usize {
-        return -(crate::error::NLE_ATTRSIZE);
+    if pol.maxlen != 0 && payload.len() > pol.maxlen as usize {
+        return Err(-(crate::error::NLE_ATTRSIZE));
     }
 
     match pol.type_ {
-        NLA_UNSPEC => 0,
-        NLA_U8 => validate_exact_payload(payload_len, core::mem::size_of::<u8>()),
-        NLA_U16 => validate_exact_payload(payload_len, core::mem::size_of::<u16>()),
-        NLA_U32 => validate_exact_payload(payload_len, core::mem::size_of::<u32>()),
-        NLA_U64 | NLA_MSECS => validate_exact_payload(payload_len, core::mem::size_of::<u64>()),
-        NLA_STRING => validate_string_payload(attr, payload_len),
-        NLA_FLAG => validate_exact_payload(payload_len, 0),
+        NLA_UNSPEC => Ok(()),
+        NLA_U8 => validate_exact_payload(payload.len(), core::mem::size_of::<u8>()),
+        NLA_U16 => validate_exact_payload(payload.len(), core::mem::size_of::<u16>()),
+        NLA_U32 => validate_exact_payload(payload.len(), core::mem::size_of::<u32>()),
+        NLA_U64 | NLA_MSECS => validate_exact_payload(payload.len(), core::mem::size_of::<u64>()),
+        NLA_STRING => validate_string_payload(payload),
+        NLA_FLAG => validate_exact_payload(payload.len(), 0),
         NLA_NESTED => {
-            if payload_len != 0 && payload_len < NLA_HDRLEN {
-                -(crate::error::NLE_ATTRSIZE)
+            if !payload.is_empty() && payload.len() < NLA_HDRLEN {
+                Err(-(crate::error::NLE_ATTRSIZE))
             } else {
-                0
+                Ok(())
             }
         }
-        _ => -(crate::error::NLE_RANGE),
+        _ => Err(-(crate::error::NLE_RANGE)),
     }
 }
 
-fn validate_exact_payload(payload_len: usize, expected: usize) -> c_int {
+fn validate_exact_payload(payload_len: usize, expected: usize) -> Result<(), c_int> {
     if payload_len == expected {
-        0
+        Ok(())
     } else {
-        -(crate::error::NLE_ATTRSIZE)
+        Err(-(crate::error::NLE_ATTRSIZE))
     }
 }
 
-unsafe fn validate_string_payload(attr: *const NlAttr, payload_len: usize) -> c_int {
-    if payload_len == 0 {
-        return -(crate::error::NLE_ATTRSIZE);
+fn validate_string_payload(payload: &[u8]) -> Result<(), c_int> {
+    if payload.is_empty() {
+        return Err(-(crate::error::NLE_ATTRSIZE));
     }
-    let data = nla_data(attr) as *const u8;
-    for i in 0..payload_len {
-        if *data.add(i) == 0 {
-            return 0;
+    if payload.contains(&0) {
+        Ok(())
+    } else {
+        Err(-(crate::error::NLE_INVAL))
+    }
+}
+
+fn parse_attrs_bytes(
+    buf: &[u8],
+    maxtype: c_int,
+    policy: Option<&[NlaPolicy]>,
+) -> Result<Vec<AttrView>, c_int> {
+    if maxtype < 0 {
+        return Err(-(crate::error::NLE_INVAL));
+    }
+
+    let mut attrs = Vec::new();
+    let mut offset = 0usize;
+    while offset < buf.len() {
+        if buf.len() - offset < NLA_HDRLEN {
+            break;
         }
+
+        let attr = parse_attr_at(buf, offset)?;
+        validate_attr_view(buf, attr, maxtype, policy)?;
+        attrs.push(attr);
+
+        let next = offset
+            .checked_add(attr.aligned_len)
+            .ok_or(-(crate::error::NLE_INVAL))?;
+        if next <= offset {
+            return Err(-(crate::error::NLE_INVAL));
+        }
+        if next > buf.len() {
+            break;
+        }
+        offset = next;
     }
-    -(crate::error::NLE_INVAL)
+    Ok(attrs)
+}
+
+unsafe fn attr_slice<'a>(head: *const NlAttr, len: c_int) -> Result<&'a [u8], c_int> {
+    if len < 0 {
+        return Err(-(crate::error::NLE_INVAL));
+    }
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if head.is_null() {
+        return Err(-(crate::error::NLE_INVAL));
+    }
+    Ok(slice::from_raw_parts(head as *const u8, len as usize))
+}
+
+unsafe fn policy_slice<'a>(
+    policy: *const c_void,
+    maxtype: c_int,
+) -> Result<Option<&'a [NlaPolicy]>, c_int> {
+    if maxtype < 0 {
+        return Err(-(crate::error::NLE_INVAL));
+    }
+    if policy.is_null() {
+        return Ok(None);
+    }
+    let len = (maxtype as usize)
+        .checked_add(1)
+        .ok_or(-(crate::error::NLE_INVAL))?;
+    Ok(Some(slice::from_raw_parts(policy as *const NlaPolicy, len)))
+}
+
+unsafe fn parse_attrs_from_raw<'a>(
+    head: *const NlAttr,
+    len: c_int,
+    maxtype: c_int,
+    policy: *const c_void,
+) -> Result<(&'a [u8], Vec<AttrView>), c_int> {
+    let bytes = attr_slice(head, len)?;
+    let policy = policy_slice(policy, maxtype)?;
+    let attrs = parse_attrs_bytes(bytes, maxtype, policy)?;
+    Ok((bytes, attrs))
+}
+
+unsafe fn attr_ptr_at(head: *const NlAttr, offset: usize) -> *mut NlAttr {
+    (head as *const u8).add(offset) as *mut NlAttr
 }
 
 // ---- size helpers ----
 
 #[no_mangle]
 pub unsafe extern "C" fn nla_attr_size(payload: c_int) -> c_int {
-    NLA_HDRLEN as c_int + payload
+    if payload < 0 {
+        return 0;
+    }
+    (NLA_HDRLEN + payload as usize).min(c_int::MAX as usize) as c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn nla_total_size(payload: c_int) -> c_int {
-    nla_align(nla_attr_size(payload) as usize) as c_int
+    if payload < 0 {
+        return 0;
+    }
+    nla_align(nla_attr_size(payload) as usize).min(c_int::MAX as usize) as c_int
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn nla_padlen(payload: c_int) -> c_int {
+    if payload < 0 {
+        return 0;
+    }
     nla_total_size(payload) - nla_attr_size(payload)
 }
 
@@ -154,8 +292,11 @@ pub unsafe extern "C" fn nla_ok(attr: *const NlAttr, remaining: c_int) -> bool {
 
 #[no_mangle]
 pub unsafe extern "C" fn nla_next(attr: *const NlAttr, remaining: *mut c_int) -> *mut NlAttr {
+    if attr.is_null() || remaining.is_null() {
+        return ptr::null_mut();
+    }
     let step = nla_align((*attr).nla_len as usize) as i32;
-    *remaining -= step;
+    *remaining = (*remaining).saturating_sub(step);
     (attr as *const u8).add(step as usize) as *mut NlAttr
 }
 
@@ -177,21 +318,21 @@ pub unsafe extern "C" fn nla_parse(
     len: c_int,
     policy: *const c_void,
 ) -> c_int {
+    if maxtype < 0 {
+        return -(crate::error::NLE_INVAL);
+    }
     if !tb.is_null() && maxtype >= 0 {
         ptr::write_bytes(tb, 0, (maxtype + 1) as usize);
     }
-    let mut pos = head;
-    let mut rem = len;
-    while nla_ok(pos, rem) {
-        let err = validate_attr(pos, maxtype, policy);
-        if err < 0 {
-            return err;
-        }
-        let t = nla_type(pos);
+    let attrs = match parse_attrs_from_raw(head, len, maxtype, policy) {
+        Ok((_bytes, attrs)) => attrs,
+        Err(err) => return err,
+    };
+    for attr in attrs {
+        let t = attr.attr_type;
         if t > 0 && t <= maxtype && !tb.is_null() {
-            *tb.add(t as usize) = pos as *mut NlAttr;
+            *tb.add(t as usize) = attr_ptr_at(head, attr.offset);
         }
-        pos = nla_next(pos, &mut rem);
     }
     0
 }
@@ -219,27 +360,22 @@ pub unsafe extern "C" fn nla_validate(
     maxtype: c_int,
     policy: *const c_void,
 ) -> c_int {
-    let mut pos = head;
-    let mut rem = len;
-    while nla_ok(pos, rem) {
-        let err = validate_attr(pos, maxtype, policy);
-        if err < 0 {
-            return err;
-        }
-        pos = nla_next(pos, &mut rem);
+    match parse_attrs_from_raw(head, len, maxtype, policy) {
+        Ok(_) => 0,
+        Err(err) => err,
     }
-    0
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn nla_find(head: *const NlAttr, len: c_int, attrtype: c_int) -> *mut NlAttr {
-    let mut pos = head;
-    let mut rem = len;
-    while nla_ok(pos, rem) {
-        if nla_type(pos) == attrtype {
-            return pos as *mut NlAttr;
+    let Ok((_bytes, attrs)) = parse_attrs_from_raw(head, len, u16::MAX as c_int, ptr::null())
+    else {
+        return ptr::null_mut();
+    };
+    for attr in attrs {
+        if attr.attr_type == attrtype {
+            return attr_ptr_at(head, attr.offset);
         }
-        pos = nla_next(pos, &mut rem);
     }
     ptr::null_mut()
 }
@@ -248,7 +384,7 @@ pub unsafe extern "C" fn nla_find(head: *const NlAttr, len: c_int, attrtype: c_i
 
 fn nla_reserve_raw(msg: *mut NlMsg, attrtype: c_int, attrlen: c_int) -> *mut NlAttr {
     unsafe {
-        if attrlen < 0 {
+        if attrlen < 0 || attrlen as usize > u16::MAX as usize - NLA_HDRLEN {
             return ptr::null_mut();
         }
         let total = nla_align(NLA_HDRLEN + attrlen as usize);
@@ -332,7 +468,7 @@ macro_rules! nla_put_int {
                 return 0 as $ty;
             }
             let mut v: $ty = 0;
-            let n = nla_len(attr) as usize;
+            let n = attr_payload_len(attr);
             libc::memcpy(
                 &mut v as *mut $ty as *mut c_void,
                 nla_data(attr),
@@ -473,8 +609,15 @@ pub unsafe extern "C" fn nla_nest_end(msg: *mut NlMsg, start: *mut NlAttr) -> c_
     }
     let hdr = (*msg).hdr();
     let msg_start = (*msg).buf as usize;
-    let attr_off = start as usize - msg_start;
+    let start_addr = start as usize;
     let tail = (*hdr).nlmsg_len as usize;
+    if start_addr < msg_start || start_addr > msg_start.saturating_add(tail) {
+        return -(crate::error::NLE_INVAL);
+    }
+    let attr_off = start_addr - msg_start;
+    if tail.saturating_sub(attr_off) > u16::MAX as usize {
+        return -(crate::error::NLE_MSGSIZE);
+    }
     (*start).nla_len = (tail - attr_off) as u16;
     (*start).nla_type |= NLA_F_NESTED;
     tail as c_int
@@ -491,8 +634,13 @@ pub unsafe extern "C" fn nla_nest_cancel(msg: *mut NlMsg, start: *mut NlAttr) {
         return;
     }
     let msg_start = (*msg).buf as usize;
-    let attr_off = start as usize - msg_start;
+    let start_addr = start as usize;
     let hdr = (*msg).hdr();
+    let tail = (*hdr).nlmsg_len as usize;
+    if start_addr < msg_start || start_addr > msg_start.saturating_add(tail) {
+        return;
+    }
+    let attr_off = start_addr - msg_start;
     (*hdr).nlmsg_len = attr_off as u32;
 }
 
@@ -676,7 +824,7 @@ mod tests {
 
             let dup = nla_strdup(attr);
             assert!(!dup.is_null());
-            assert_eq!(libc::strcmp(dup as *const i8, c"abc".as_ptr()), 0);
+            assert_eq!(libc::strcmp(dup as *const libc::c_char, c"abc".as_ptr()), 0);
             assert_eq!(nla_strcmp(attr, c"abc".as_ptr() as *const u8), 0);
             assert!(nla_strcmp(attr, c"abcd".as_ptr() as *const u8) < 0);
             libc::free(dup as *mut c_void);
@@ -720,6 +868,95 @@ mod tests {
             assert!(nla_reserve(msg, 1, -1).is_null());
             assert_eq!(nla_put(msg, 1, -1, ptr::null()), -(crate::error::NLE_INVAL));
             nlmsg_free(msg);
+        }
+    }
+
+    #[test]
+    fn size_helpers_reject_negative_payloads() {
+        unsafe {
+            assert_eq!(nla_attr_size(-1), 0);
+            assert_eq!(nla_total_size(-1), 0);
+            assert_eq!(nla_padlen(-1), 0);
+        }
+    }
+
+    #[test]
+    fn nest_helpers_reject_foreign_start_pointer() {
+        unsafe {
+            let msg = nlmsg_alloc();
+            assert!(!msg.is_null());
+            let mut foreign = NlAttr::default();
+
+            assert_eq!(nla_nest_end(msg, &mut foreign), -(crate::error::NLE_INVAL));
+            nla_nest_cancel(msg, &mut foreign);
+
+            nlmsg_free(msg);
+        }
+    }
+
+    fn push_attr(buf: &mut Vec<u8>, attr_type: u16, payload: &[u8]) {
+        let len = (NLA_HDRLEN + payload.len()) as u16;
+        buf.extend_from_slice(&len.to_ne_bytes());
+        buf.extend_from_slice(&attr_type.to_ne_bytes());
+        buf.extend_from_slice(payload);
+        while !buf.len().is_multiple_of(4) {
+            buf.push(0);
+        }
+    }
+
+    #[test]
+    fn byte_parser_walks_valid_attributes_by_offset() {
+        let mut buf = Vec::new();
+        push_attr(&mut buf, 1, &[9]);
+        push_attr(&mut buf, 2, b"ok\0");
+
+        let mut policy = [NlaPolicy::default(); 3];
+        policy[1] = NlaPolicy {
+            type_: NLA_U8,
+            minlen: 0,
+            maxlen: 0,
+        };
+        policy[2] = NlaPolicy {
+            type_: NLA_STRING,
+            minlen: 0,
+            maxlen: 0,
+        };
+
+        let attrs = parse_attrs_bytes(&buf, 2, Some(&policy)).unwrap();
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs[0].offset, 0);
+        assert_eq!(attrs[0].payload_len, 1);
+        assert_eq!(attrs[1].attr_type, 2);
+    }
+
+    #[test]
+    fn byte_parser_rejects_truncated_attribute_headers_and_bodies() {
+        let short_header = [1u8, 0, 0, 0];
+        assert_eq!(
+            parse_attrs_bytes(&short_header, 1, None),
+            Err(-(crate::error::NLE_INVAL))
+        );
+
+        let mut short_body = Vec::new();
+        short_body.extend_from_slice(&(8u16).to_ne_bytes());
+        short_body.extend_from_slice(&(1u16).to_ne_bytes());
+        short_body.extend_from_slice(&[1, 2]);
+        assert_eq!(
+            parse_attrs_bytes(&short_body, 1, None),
+            Err(-(crate::error::NLE_INVAL))
+        );
+    }
+
+    #[test]
+    fn byte_parser_is_total_over_deterministic_garbage_inputs() {
+        let mut state = 0x1234_5678u32;
+        for len in 0..96usize {
+            let mut buf = vec![0u8; len];
+            for byte in &mut buf {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *byte = (state >> 24) as u8;
+            }
+            let _ = parse_attrs_bytes(&buf, 16, None);
         }
     }
 }
