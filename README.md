@@ -1,4 +1,4 @@
-# nloxide
+# nloxide  - part of the GNO stack
 
 A clean-room, BSD-2-Clause licensed compatibility layer for the subset of
 `libnl-3` and `libnl-genl-3` used by the `hostapd` and `wpa_supplicant`
